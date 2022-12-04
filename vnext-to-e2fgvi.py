@@ -176,7 +176,10 @@ def main_worker():
                              min(video_length, f + neighbor_stride + 1))
         ]
         ref_ids = get_ref_index(f, neighbor_ids, video_length)
-        #print(f'BDUB - neighbor_ids: {neighbor_ids}, ref_ids: {ref_ids}')
+        all_ids = neighbor_ids + ref_ids
+
+        print(f'Neighbor frame IDs: {neighbor_ids}')
+        print(f'Reference frame IDs: {ref_ids}')
 
         # Get the mask images from VNext predictor
         vnext_masks = []
@@ -204,10 +207,6 @@ def main_worker():
             visualizer = Visualizer(masked_img, None, instance_mode=vnext_viz_colormode)
             vis_frame = visualizer.draw_instance_predictions(predictions=instances)
             vnext_masks.append(cv2.cvtColor(vis_frame.get_image(), cv2.COLOR_RGB2BGR))
-            #cv2.namedWindow("VNext segmentation: " + str(idx), cv2.WINDOW_NORMAL)
-            #cv2.imshow("VNext segmentation: " + str(idx), vnext_masks[-1])
-            #if cv2.waitKey(1) == 27:
-            #    break
         
         if len(vnext_masks) == 0:
             continue
@@ -216,11 +215,31 @@ def main_worker():
         binary_masks = [
             np.expand_dims((np.array(m) != 0).astype(np.uint8), 2) for m in masks
         ]
+
+        '''# Visualize the masked images
+        for idx in range(len(tmp)):
+            m = np.array(masks[idx])
+            cv2.namedWindow("Mask img: " + str(tmp[idx]), cv2.WINDOW_NORMAL)
+            cv2.imshow("Mask img: " + str(tmp[idx]), m)
+            if cv2.waitKey(0) == 27:
+                break
+        '''
+
         masks = to_tensors()(masks).unsqueeze(0)
-        selected_imgs = imgs[:1, neighbor_ids + ref_ids, :, :, :]
+        selected_imgs = imgs[:1, all_ids, :, :, :]
         selected_imgs, masks = selected_imgs.to(device), masks.to(device)
         with torch.no_grad():
             masked_imgs = selected_imgs * (1 - masks)
+            '''# Visualize original images with mask holes
+            for idx in range(len(all_ids)):
+                m = np.array(masked_imgs.to(torch.device('cpu'))).squeeze()[idx].transpose(1, 2, 0) * 255
+                m = cv2.cvtColor(m.astype(np.uint8), cv2.COLOR_RGB2BGR)
+                cv2.namedWindow("Mask img: " + str(tmp[idx]), cv2.WINDOW_NORMAL)
+                cv2.imshow("Mask img: " + str(tmp[idx]), m)
+                if cv2.waitKey(0) == 27:
+                    break
+            '''
+
             mod_size_h = 60
             mod_size_w = 108
             h_pad = (mod_size_h - h % mod_size_h) % mod_size_h
@@ -240,6 +259,22 @@ def main_worker():
                 img = np.array(pred_imgs[i]).astype(
                     np.uint8) * binary_masks[i] + frames[idx] * (
                         1 - binary_masks[i])
+
+                '''# Visualize the intermediate results
+                bm = binary_masks[i]
+                bm[bm > 0] = 255
+                cv2.namedWindow("binary mask: " + str(idx), cv2.WINDOW_NORMAL)
+                cv2.imshow("binary mask: " + str(idx), bm)
+                cv2.namedWindow("frame: " + str(idx), cv2.WINDOW_NORMAL)
+                cv2.imshow("frame: " + str(idx), frames[idx])
+                cv2.namedWindow("pred img: " + str(idx), cv2.WINDOW_NORMAL)
+                cv2.imshow("pred img: " + str(idx), np.array(pred_imgs[i]).astype(np.uint8))
+                cv2.namedWindow("img: " + str(idx), cv2.WINDOW_NORMAL)
+                cv2.imshow("img: " + str(idx), img)
+                if cv2.waitKey(0) == 27:
+                    break
+                '''
+
                 if comp_frames[idx] is None:
                     comp_frames[idx] = img
                 else:
