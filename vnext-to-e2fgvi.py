@@ -44,6 +44,7 @@ ref_length = args.step  # ref_step
 num_ref = args.num_ref
 neighbor_stride = args.neighbor_stride
 default_fps = args.savefps
+CLASS_PERSON_VALUE = 0
 
 # VNext constants
 VNEXT_CONFIG_PATH = "VNext/configs/quick_schedules/mask_rcnn_R_50_FPN_inference_acc_test.yaml"
@@ -188,9 +189,9 @@ def main_worker():
             if 'instances' not in predictions:
                 break
 
-            # Remove all segmentation instances for classes that are not people (class 0 are people)
+            # Only use segmentation masks that are not of people (remove occlusions for people)
             instances = predictions['instances'].to(torch.device("cpu"))
-            instances = instances[instances.pred_classes == 0]
+            instances = instances[instances.pred_classes != CLASS_PERSON_VALUE]
 
             # Remove our boxes, classes, and scores from the segmentation instances before
             # we draw our masked images to prevent the labels and boxes from being drawn
@@ -238,8 +239,8 @@ def main_worker():
             for idx in range(len(all_ids)):
                 m = np.array(masked_imgs.to(torch.device('cpu'))).squeeze()[idx].transpose(1, 2, 0) * 255
                 m = cv2.cvtColor(m.astype(np.uint8), cv2.COLOR_RGB2BGR)
-                cv2.namedWindow("Mask img: " + str(tmp[idx]), cv2.WINDOW_NORMAL)
-                cv2.imshow("Mask img: " + str(tmp[idx]), m)
+                cv2.namedWindow("Mask img: " + str(all_ids[idx]), cv2.WINDOW_NORMAL)
+                cv2.imshow("Mask img: " + str(all_ids[idx]), m)
                 if cv2.waitKey(0) == 27:
                     break
             '''
