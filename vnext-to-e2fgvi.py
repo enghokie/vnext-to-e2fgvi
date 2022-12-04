@@ -90,7 +90,7 @@ def preprocess_masks(masks, size):
         m = cv2.cvtColor(m, cv2.COLOR_BGR2GRAY)
         m = np.array(m > 0).astype(np.uint8)
         m = cv2.dilate(m,
-                       cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3)),
+                       cv2.getStructuringElement(cv2.MORPH_CROSS, (6, 6)),
                        iterations=4)
         out_masks.append(Image.fromarray(m * 255))
     
@@ -188,12 +188,16 @@ def main_worker():
             if 'instances' not in predictions:
                 break
 
+            # Remove all segmentation instances for classes that are not people (class 0 are people)
+            instances = predictions['instances'].to(torch.device("cpu"))
+            instances = instances[instances.pred_classes == 0]
+
             # Remove our boxes, classes, and scores from the segmentation instances before
             # we draw our masked images to prevent the labels and boxes from being drawn
-            instances = predictions['instances'].to(torch.device("cpu"))
             pred_boxes = instances.get('pred_boxes').tensor.numpy() if instances.has('pred_boxes') else None
             pred_scores = instances.get('scores') if instances.has('scores') else None
-            pred_classes = instances.get('pred_classes').numpy() if instances.has('pred_classes') else None
+            pred_classes = instances.pred_classes.tolist() if instances.has("pred_classes") else None
+
             if instances.has('pred_boxes'):
                 instances.remove('pred_boxes')
             if instances.has('scores'):
