@@ -22,7 +22,6 @@ from VNext.detectron2.utils.visualizer import ColorMode, Visualizer
 parser = argparse.ArgumentParser(description="E2FGVI")
 parser.add_argument("-v", "--video", type=str, required=True)
 parser.add_argument("-c", "--ckpt", type=str, required=True)
-parser.add_argument("-m", "--mask", type=str, required=True)
 parser.add_argument("--model", type=str, choices=['e2fgvi', 'e2fgvi_hq'])
 parser.add_argument("--step", type=int, default=10)
 parser.add_argument("--num_ref", type=int, default=-1)
@@ -82,23 +81,6 @@ def get_ref_index(f, neighbor_ids, length):
                     break
                 ref_index.append(i)
     return ref_index
-
-
-# read frame-wise masks
-def read_mask(mpath, size):
-    masks = []
-    mnames = os.listdir(mpath)
-    mnames.sort()
-    for mp in mnames:
-        m = Image.open(os.path.join(mpath, mp))
-        m = m.resize(size, Image.NEAREST)
-        m = np.array(m.convert('L'))
-        m = np.array(m > 0).astype(np.uint8)
-        m = cv2.dilate(m,
-                       cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3)),
-                       iterations=4)
-        masks.append(Image.fromarray(m * 255))
-    return masks
 
 
 def preprocess_masks(masks, size):
@@ -173,7 +155,7 @@ def main_worker():
     # prepare datset
     args.use_mp4 = True if args.video.endswith('.mp4') else False
     print(
-        f'Loading videos and masks from: {args.video} | INPUT MP4 format: {args.use_mp4}'
+        f'Loading videos from: {args.video} | INPUT MP4 format: {args.use_mp4}'
     )
     frames = read_frame_from_videos(args)
     frames, size = resize_frames(frames, size)
