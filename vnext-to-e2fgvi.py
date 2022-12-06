@@ -9,6 +9,7 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 from matplotlib import animation
 import torch
+from datetime import datetime
 
 from core.utils import to_tensors
 
@@ -78,7 +79,7 @@ def get_ref_index(f, neighbor_ids, length):
         end_idx = min(length, f + ref_length * (num_ref // 2))
         for i in range(start_idx, end_idx + 1, ref_length):
             if i not in neighbor_ids:
-                if len(ref_index) > num_ref:
+                if len(ref_index) > num_ref or i > (length - 1):
                     break
                 ref_index.append(i)
     return ref_index
@@ -171,23 +172,41 @@ def main_worker():
 
     # completing holes by e2fgvi
     print(f'Start test...')
+    sequences = 0
+    total_frames = 0
+    vnext_model_elapsed = 0.0
+    vnext_process_elapsed = 0.0
+    e2fgvi_model_elapsed = 0.0
+    e2fgvi_process_elapsed = 0.0
+    total_vnext_model_elapsed = 0.0
+    total_vnext_process_elapsed = 0.0
+    total_e2fgvi_model_elapsed = 0.0
+    total_e2fgvi_process_elapsed = 0.0
     for f in tqdm(range(0, video_length, neighbor_stride)):
+        sequences += 1
         neighbor_ids = [
             i for i in range(max(0, f - neighbor_stride),
                              min(video_length, f + neighbor_stride + 1))
         ]
         ref_ids = get_ref_index(f, neighbor_ids, video_length)
         all_ids = neighbor_ids + ref_ids
+        total_frames += len(all_ids)
 
         print(f'Neighbor frame IDs: {neighbor_ids}')
         print(f'Reference frame IDs: {ref_ids}')
 
         # Get the mask images from VNext predictor
         vnext_masks = []
+        vnext_process_start = datetime.now()
         for idx in neighbor_ids + ref_ids:
+            vnext_model_start = datetime.now()
             predictions = vnext_seg_predictor(frames[idx])
-            if 'instances' not in predictions:
-                break
+            vnext_model_elapsed += (datetime.now() - vnext_model_start).total_seconds()
+
+            # If we don't have any detections then just use the original frame
+            if 'instances' not in predictions or len(predictions['instances']) <= 0:
+                vnext_masks.append(frames[idx])
+                continue
 
             # Only use segmentation masks that are not of people (remove occlusions for people)
             instances = predictions['instances'].to(torch.device("cpu"))
@@ -212,9 +231,6 @@ def main_worker():
             visualizer = Visualizer(masked_img, None, instance_mode=vnext_viz_colormode)
             vis_frame = visualizer.draw_instance_predictions(predictions=instances)
             vnext_masks.append(cv2.cvtColor(vis_frame.get_image(), cv2.COLOR_RGB2BGR))
-        
-        if len(vnext_masks) == 0:
-            continue
 
         masks = preprocess_masks(vnext_masks, size)
         binary_masks = [
@@ -231,6 +247,8 @@ def main_worker():
         '''
 
         masks = to_tensors()(masks).unsqueeze(0)
+        vnext_process_elapsed += (datetime.now() - vnext_process_start).total_seconds()
+        e2fgvi_process_start = datetime.now()
         selected_imgs = imgs[:1, all_ids, :, :, :]
         selected_imgs, masks = selected_imgs.to(device), masks.to(device)
         with torch.no_grad():
@@ -255,7 +273,10 @@ def main_worker():
             masked_imgs = torch.cat(
                 [masked_imgs, torch.flip(masked_imgs, [4])],
                 4)[:, :, :, :, :w + w_pad]
+
+            e2fgvi_model_start = datetime.now()
             pred_imgs, _ = model(masked_imgs, len(neighbor_ids))
+            e2fgvi_model_elapsed += (datetime.now() - e2fgvi_model_start).total_seconds()
             pred_imgs = pred_imgs[:, :, :h, :w]
             pred_imgs = (pred_imgs + 1) / 2
             pred_imgs = pred_imgs.cpu().permute(0, 2, 3, 1).numpy() * 255
@@ -285,6 +306,35 @@ def main_worker():
                 else:
                     comp_frames[idx] = comp_frames[idx].astype(
                         np.float32) * 0.5 + img.astype(np.float32) * 0.5
+
+            e2fgvi_process_elapsed += (datetime.now() - e2fgvi_process_start).total_seconds()
+            if sequences == 10:
+                total_vnext_model_elapsed += vnext_model_elapsed / 10
+                total_vnext_process_elapsed += vnext_process_elapsed / 10
+                total_e2fgvi_model_elapsed += e2fgvi_model_elapsed / 10
+                total_e2fgvi_process_elapsed += e2fgvi_process_elapsed / 10
+
+                vnext_model_elapsed = 0
+                vnext_process_elapsed = 0
+                e2fgvi_model_elapsed = 0
+                e2fgvi_process_elapsed = 0
+
+    # log time results
+    if sequences % 10 != 0:
+        total_vnext_model_elapsed += vnext_model_elapsed / sequences
+        total_vnext_process_elapsed += vnext_process_elapsed / sequences
+        total_e2fgvi_model_elapsed += e2fgvi_model_elapsed / sequences
+        total_e2fgvi_process_elapsed += e2fgvi_process_elapsed / sequences
+
+    print(f'Total sequences: {sequences}, total frames: {total_frames}')
+    print(f'VNext model time avg: {total_vnext_model_elapsed * 1000}ms per sequence')
+    print(f'VNext process time avg: {total_vnext_process_elapsed * 1000}ms per sequence')
+    print(f'E2FGVI model time avg: {total_e2fgvi_model_elapsed * 1000}ms per sequence')
+    print(f'E2FGVI process time avg: {total_e2fgvi_process_elapsed * 1000}ms per sequence')
+    print(f'VNext model time avg: {(total_vnext_model_elapsed * sequences * 1000) / total_frames}ms per frame')
+    print(f'VNext process time avg: {(total_vnext_process_elapsed * sequences * 1000) / total_frames}ms per frame')
+    print(f'E2FGVI model time avg: {(total_e2fgvi_model_elapsed * sequences * 1000) / total_frames}ms per frame')
+    print(f'E2FGVI process time avg: {(total_e2fgvi_process_elapsed * sequences * 1000) / total_frames}ms per frame')
 
     # saving videos
     print('Saving videos...')
