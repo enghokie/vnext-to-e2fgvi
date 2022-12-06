@@ -37,6 +37,10 @@ parser.add_argument("--height", type=int)
 # VNext args
 parser.add_argument("--confidence-threshold", type=float, default=0.5)
 
+# Webcam function args 
+parser.add_argument("--webcam", type=bool, default=False)
+parser.add_argument("--max_frames", type=int, default=50)
+
 args = parser.parse_args()
 
 
@@ -83,6 +87,22 @@ def get_ref_index(f, neighbor_ids, length):
                 ref_index.append(i)
     return ref_index
 
+# sample references from video history (used with webcam version)
+def get_live_ref_index(f, neighbor_ids, length):
+    ref_index = []
+    if num_ref == -1:
+        for i in range(0, length, ref_length):
+            if i not in neighbor_ids:
+                ref_index.append(i)
+    else:
+        start_idx = max(0, f - ref_length * num_ref)
+        end_idx = length
+        for i in range(start_idx, end_idx + 1, ref_length):
+            if i not in neighbor_ids:
+                if len(ref_index) > num_ref:
+                    break 
+                ref_index.append(i)
+    return ref_index 
 
 # read frame-wise masks
 def read_mask(mpath, size):
@@ -149,162 +169,292 @@ def resize_frames(frames, size=None):
 
 
 def main_worker():
-    # Set up VNext predictor
-    vnext_cfg = setup_cfg(args)
-    vnext_seg_predictor = DefaultPredictor(vnext_cfg)
+    if args.webcam == False:
+        # Set up VNext predictor
+        vnext_cfg = setup_cfg(args)
+        vnext_seg_predictor = DefaultPredictor(vnext_cfg)
 
-    # set up models
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # set up models
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    if args.model == "e2fgvi":
-        size = (432, 240)
-    elif args.set_size:
-        size = (args.width, args.height)
+        if args.model == "e2fgvi":
+            size = (432, 240)
+        elif args.set_size:
+            size = (args.width, args.height)
+        else:
+            size = None
+
+        net = importlib.import_module('model.' + args.model)
+        model = net.InpaintGenerator().to(device)
+        data = torch.load(args.ckpt, map_location=device)
+        model.load_state_dict(data)
+        print(f'Loading model from: {args.ckpt}')
+        model.eval()
+
+        # prepare datset
+        args.use_mp4 = True if args.video.endswith('.mp4') else False
+        print(
+            f'Loading videos and masks from: {args.video} | INPUT MP4 format: {args.use_mp4}'
+        )
+        frames = read_frame_from_videos(args)
+        frames, size = resize_frames(frames, size)
+        h, w = size[1], size[0]
+        video_length = len(frames)
+        imgs = to_tensors()(frames).unsqueeze(0) * 2 - 1
+        frames = [np.array(f).astype(np.uint8) for f in frames]
+        comp_frames = [None] * video_length
+
+        # prepare VNext
+        vnext_viz_colormode = ColorMode.IMAGE_BW
+
+        # completing holes by e2fgvi
+        print(f'Start test...')
+        for f in tqdm(range(0, video_length, neighbor_stride)):
+            neighbor_ids = [
+                i for i in range(max(0, f - neighbor_stride),
+                                 min(video_length, f + neighbor_stride + 1))
+            ]
+            ref_ids = get_ref_index(f, neighbor_ids, video_length)
+            #print(f'BDUB - neighbor_ids: {neighbor_ids}, ref_ids: {ref_ids}')
+
+            # Get the mask images from VNext predictor
+            vnext_masks = []
+            for idx in neighbor_ids + ref_ids:
+                predictions = vnext_seg_predictor(frames[idx])
+                if 'instances' not in predictions:
+                    break
+
+                # Remove our boxes, classes, and scores from the segmentation instances before
+                # we draw our masked images to prevent the labels and boxes from being drawn
+                instances = predictions['instances'].to(torch.device("cpu"))
+                pred_boxes = instances.get('pred_boxes').tensor.numpy() if instances.has('pred_boxes') else None
+                pred_scores = instances.get('scores') if instances.has('scores') else None
+                pred_classes = instances.get('pred_classes').numpy() if instances.has('pred_classes') else None
+                if instances.has('pred_boxes'):
+                    instances.remove('pred_boxes')
+                if instances.has('scores'):
+                    instances.remove('scores')
+                if instances.has('pred_classes'):
+                    instances.remove('pred_classes')
+
+                # Get our segmentation masked images
+                masked_img = np.zeros_like(frames[idx])
+                masked_img = masked_img[:, :, ::-1]
+                visualizer = Visualizer(masked_img, None, instance_mode=vnext_viz_colormode)
+                vis_frame = visualizer.draw_instance_predictions(predictions=instances)
+                vnext_masks.append(cv2.cvtColor(vis_frame.get_image(), cv2.COLOR_RGB2BGR))
+                #cv2.namedWindow("VNext segmentation: " + str(idx), cv2.WINDOW_NORMAL)
+                #cv2.imshow("VNext segmentation: " + str(idx), vnext_masks[-1])
+                #if cv2.waitKey(1) == 27:
+                #    break
+            
+            if len(vnext_masks) == 0:
+                continue
+
+            masks = preprocess_masks(vnext_masks, size)
+            binary_masks = [
+                np.expand_dims((np.array(m) != 0).astype(np.uint8), 2) for m in masks
+            ]
+            masks = to_tensors()(masks).unsqueeze(0)
+            selected_imgs = imgs[:1, neighbor_ids + ref_ids, :, :, :]
+            selected_imgs, masks = selected_imgs.to(device), masks.to(device)
+            with torch.no_grad():
+                masked_imgs = selected_imgs * (1 - masks)
+                mod_size_h = 60
+                mod_size_w = 108
+                h_pad = (mod_size_h - h % mod_size_h) % mod_size_h
+                w_pad = (mod_size_w - w % mod_size_w) % mod_size_w
+                masked_imgs = torch.cat(
+                    [masked_imgs, torch.flip(masked_imgs, [3])],
+                    3)[:, :, :, :h + h_pad, :]
+                masked_imgs = torch.cat(
+                    [masked_imgs, torch.flip(masked_imgs, [4])],
+                    4)[:, :, :, :, :w + w_pad]
+                pred_imgs, _ = model(masked_imgs, len(neighbor_ids))
+                pred_imgs = pred_imgs[:, :, :h, :w]
+                pred_imgs = (pred_imgs + 1) / 2
+                pred_imgs = pred_imgs.cpu().permute(0, 2, 3, 1).numpy() * 255
+                for i in range(len(neighbor_ids)):
+                    idx = neighbor_ids[i]
+                    img = np.array(pred_imgs[i]).astype(
+                        np.uint8) * binary_masks[i] + frames[idx] * (
+                            1 - binary_masks[i])
+                    if comp_frames[idx] is None:
+                        comp_frames[idx] = img
+                    else:
+                        comp_frames[idx] = comp_frames[idx].astype(
+                            np.float32) * 0.5 + img.astype(np.float32) * 0.5
+
+        # saving videos
+        print('Saving videos...')
+        save_dir_name = 'results'
+        ext_name = '_results.mp4'
+        save_base_name = args.video.split('/')[-1]
+        save_name = save_base_name.replace(
+            '.mp4', ext_name) if args.use_mp4 else save_base_name + ext_name
+        if not os.path.exists(save_dir_name):
+            os.makedirs(save_dir_name)
+        save_path = os.path.join(save_dir_name, save_name)
+        writer = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*"mp4v"),
+                                 default_fps, size)
+        for f in range(video_length):
+            comp = comp_frames[f].astype(np.uint8)
+            writer.write(cv2.cvtColor(comp, cv2.COLOR_BGR2RGB))
+        writer.release()
+        print(f'Finish test! The result video is saved in: {save_path}.')
+
+        # show results
+        print('Let us enjoy the result!')
+        fig = plt.figure('Let us enjoy the result')
+        ax1 = fig.add_subplot(1, 2, 1)
+        ax1.axis('off')
+        ax1.set_title('Original Video')
+        ax2 = fig.add_subplot(1, 2, 2)
+        ax2.axis('off')
+        ax2.set_title('Our Result')
+        imdata1 = ax1.imshow(frames[0])
+        imdata2 = ax2.imshow(comp_frames[0].astype(np.uint8))
+
+        def update(idx):
+            imdata1.set_data(frames[idx])
+            imdata2.set_data(comp_frames[idx].astype(np.uint8))
+
+        fig.tight_layout()
+        anim = animation.FuncAnimation(fig,
+                                       update,
+                                       frames=len(frames),
+                                       interval=50)
+        plt.show()
+    
+    #webcam functionality
     else:
-        size = None
+        # Set up VNext predictor
+        vnext_cfg = setup_cfg(args)
+        vnext_seg_predictor = DefaultPredictor(vnext_cfg)
 
-    net = importlib.import_module('model.' + args.model)
-    model = net.InpaintGenerator().to(device)
-    data = torch.load(args.ckpt, map_location=device)
-    model.load_state_dict(data)
-    print(f'Loading model from: {args.ckpt}')
-    model.eval()
+        # set up models
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # prepare datset
-    args.use_mp4 = True if args.video.endswith('.mp4') else False
-    print(
-        f'Loading videos and masks from: {args.video} | INPUT MP4 format: {args.use_mp4}'
-    )
-    frames = read_frame_from_videos(args)
-    frames, size = resize_frames(frames, size)
-    h, w = size[1], size[0]
-    video_length = len(frames)
-    imgs = to_tensors()(frames).unsqueeze(0) * 2 - 1
-    frames = [np.array(f).astype(np.uint8) for f in frames]
-    comp_frames = [None] * video_length
+        if args.model == "e2fgvi":
+            size = (432, 240)
+        elif args.set_size:
+            size = (args.width, args.height)
+        else:
+            size = None
 
-    # prepare VNext
-    vnext_viz_colormode = ColorMode.IMAGE_BW
-
-    # completing holes by e2fgvi
-    print(f'Start test...')
-    for f in tqdm(range(0, video_length, neighbor_stride)):
-        neighbor_ids = [
-            i for i in range(max(0, f - neighbor_stride),
-                             min(video_length, f + neighbor_stride + 1))
-        ]
-        ref_ids = get_ref_index(f, neighbor_ids, video_length)
-        #print(f'BDUB - neighbor_ids: {neighbor_ids}, ref_ids: {ref_ids}')
-
-        # Get the mask images from VNext predictor
-        vnext_masks = []
-        for idx in neighbor_ids + ref_ids:
-            predictions = vnext_seg_predictor(frames[idx])
-            if 'instances' not in predictions:
-                break
-
-            # Remove our boxes, classes, and scores from the segmentation instances before
-            # we draw our masked images to prevent the labels and boxes from being drawn
-            instances = predictions['instances'].to(torch.device("cpu"))
-            pred_boxes = instances.get('pred_boxes').tensor.numpy() if instances.has('pred_boxes') else None
-            pred_scores = instances.get('scores') if instances.has('scores') else None
-            pred_classes = instances.get('pred_classes').numpy() if instances.has('pred_classes') else None
-            if instances.has('pred_boxes'):
-                instances.remove('pred_boxes')
-            if instances.has('scores'):
-                instances.remove('scores')
-            if instances.has('pred_classes'):
-                instances.remove('pred_classes')
-
-            # Get our segmentation masked images
-            masked_img = np.zeros_like(frames[idx])
-            masked_img = masked_img[:, :, ::-1]
-            visualizer = Visualizer(masked_img, None, instance_mode=vnext_viz_colormode)
-            vis_frame = visualizer.draw_instance_predictions(predictions=instances)
-            vnext_masks.append(cv2.cvtColor(vis_frame.get_image(), cv2.COLOR_RGB2BGR))
-            #cv2.namedWindow("VNext segmentation: " + str(idx), cv2.WINDOW_NORMAL)
-            #cv2.imshow("VNext segmentation: " + str(idx), vnext_masks[-1])
-            #if cv2.waitKey(1) == 27:
-            #    break
+        net = importlib.import_module('model.' + args.model)
+        model = net.InpaintGenerator().to(device)
+        data = torch.load(args.ckpt, map_location=device)
+        model.load_state_dict(data)
+        print(f'Loading model from: {args.ckpt}')
+        model.eval()
         
-        if len(vnext_masks) == 0:
-            continue
+        videoHistory = []
+        h, w = size[1], size[0]
+        video_length = max_frames
+        # prepare VNext
+        vnext_viz_colormode = ColorMode.IMAGE_BW
+        
+        for f in tqdm(range(0, video_length, neighbor_stride)):
+            neighbor_ids = [
+                i for i in range(max(0, f - neighbor_stride),
+                                 min(video_length, f + neighbor_stride + 1))
+            ]
+        ref_ids = get_ref_index(f, neighbor_ids, video_length)
+        
+        #set up webcam https://subscription.packtpub.com/book/application-development/9781785283932/3/ch03lvl1sec28/accessing-the-webcam
+        cap = cv2.VideoCapture(0)
+        
+        #check if webcam is opened correctly
+        if not cap.isOpened():
+            raise IOError("Cannot open webcam")
+        
+        while True:
+            ret, frame = cap.read()
+            if len(videoHistory) < max_frames:
+                videoHistory.append(cv2.resize(frame, size))
+                continue
+            else:
+                videoHistory = videoHistory[1:48] + [cv2.resize(frame, size)]
+                # prepare dataset
+                frames, size = resize_frames(videoHistory, size)
+                h, w = size[1], size[0]
+                video_length = len(frames)
+                imgs = to_tensors()(frames).unsqueeze(0) * 2 - 1
+                frames = [np.array(f).astype(np.uint8) for f in frames]
+                comp_frames = [None] * video_length
+                #get segmentation/masks using frames
+                vnext_masks = []
+                for idx in neighbor_ids + ref_ids:
+                    predictions = vnext_seg_predictor(frames[idx])
+                    if 'instances' not in predictions:
+                        break
 
-        masks = preprocess_masks(vnext_masks, size)
-        binary_masks = [
-            np.expand_dims((np.array(m) != 0).astype(np.uint8), 2) for m in masks
-        ]
-        masks = to_tensors()(masks).unsqueeze(0)
-        selected_imgs = imgs[:1, neighbor_ids + ref_ids, :, :, :]
-        selected_imgs, masks = selected_imgs.to(device), masks.to(device)
-        with torch.no_grad():
-            masked_imgs = selected_imgs * (1 - masks)
-            mod_size_h = 60
-            mod_size_w = 108
-            h_pad = (mod_size_h - h % mod_size_h) % mod_size_h
-            w_pad = (mod_size_w - w % mod_size_w) % mod_size_w
-            masked_imgs = torch.cat(
-                [masked_imgs, torch.flip(masked_imgs, [3])],
-                3)[:, :, :, :h + h_pad, :]
-            masked_imgs = torch.cat(
-                [masked_imgs, torch.flip(masked_imgs, [4])],
-                4)[:, :, :, :, :w + w_pad]
-            pred_imgs, _ = model(masked_imgs, len(neighbor_ids))
-            pred_imgs = pred_imgs[:, :, :h, :w]
-            pred_imgs = (pred_imgs + 1) / 2
-            pred_imgs = pred_imgs.cpu().permute(0, 2, 3, 1).numpy() * 255
-            for i in range(len(neighbor_ids)):
-                idx = neighbor_ids[i]
-                img = np.array(pred_imgs[i]).astype(
-                    np.uint8) * binary_masks[i] + frames[idx] * (
-                        1 - binary_masks[i])
-                if comp_frames[idx] is None:
-                    comp_frames[idx] = img
-                else:
-                    comp_frames[idx] = comp_frames[idx].astype(
-                        np.float32) * 0.5 + img.astype(np.float32) * 0.5
+                    # Remove our boxes, classes, and scores from the segmentation instances before
+                    # we draw our masked images to prevent the labels and boxes from being drawn
+                    instances = predictions['instances'].to(torch.device("cpu"))
+                    pred_boxes = instances.get('pred_boxes').tensor.numpy() if instances.has('pred_boxes') else None
+                    pred_scores = instances.get('scores') if instances.has('scores') else None
+                    pred_classes = instances.get('pred_classes').numpy() if instances.has('pred_classes') else None
+                    if instances.has('pred_boxes'):
+                        instances.remove('pred_boxes')
+                    if instances.has('scores'):
+                        instances.remove('scores')
+                    if instances.has('pred_classes'):
+                        instances.remove('pred_classes')
 
-    # saving videos
-    print('Saving videos...')
-    save_dir_name = 'results'
-    ext_name = '_results.mp4'
-    save_base_name = args.video.split('/')[-1]
-    save_name = save_base_name.replace(
-        '.mp4', ext_name) if args.use_mp4 else save_base_name + ext_name
-    if not os.path.exists(save_dir_name):
-        os.makedirs(save_dir_name)
-    save_path = os.path.join(save_dir_name, save_name)
-    writer = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*"mp4v"),
-                             default_fps, size)
-    for f in range(video_length):
-        comp = comp_frames[f].astype(np.uint8)
-        writer.write(cv2.cvtColor(comp, cv2.COLOR_BGR2RGB))
-    writer.release()
-    print(f'Finish test! The result video is saved in: {save_path}.')
-
-    # show results
-    print('Let us enjoy the result!')
-    fig = plt.figure('Let us enjoy the result')
-    ax1 = fig.add_subplot(1, 2, 1)
-    ax1.axis('off')
-    ax1.set_title('Original Video')
-    ax2 = fig.add_subplot(1, 2, 2)
-    ax2.axis('off')
-    ax2.set_title('Our Result')
-    imdata1 = ax1.imshow(frames[0])
-    imdata2 = ax2.imshow(comp_frames[0].astype(np.uint8))
-
-    def update(idx):
-        imdata1.set_data(frames[idx])
-        imdata2.set_data(comp_frames[idx].astype(np.uint8))
-
-    fig.tight_layout()
-    anim = animation.FuncAnimation(fig,
-                                   update,
-                                   frames=len(frames),
-                                   interval=50)
-    plt.show()
-
+                    # Get our segmentation masked images
+                    masked_img = np.zeros_like(frames[idx])
+                    masked_img = masked_img[:, :, ::-1]
+                    visualizer = Visualizer(masked_img, None, instance_mode=vnext_viz_colormode)
+                    vis_frame = visualizer.draw_instance_predictions(predictions=instances)
+                    vnext_masks.append(cv2.cvtColor(vis_frame.get_image(), cv2.COLOR_RGB2BGR))
+                
+                
+                #input segmentation and reference frames into e2fgvi 
+                masks = preprocess_masks(vnext_masks, size)
+                binary_masks = [
+                    np.expand_dims((np.array(m) != 0).astype(np.uint8), 2) for m in masks
+                ]
+                masks = to_tensors()(masks).unsqueeze(0)
+                selected_imgs = imgs[:1, neighbor_ids + ref_ids, :, :, :]
+                selected_imgs, masks = selected_imgs.to(device), masks.to(device)
+                with torch.no_grad():
+                    masked_imgs = selected_imgs * (1 - masks)
+                    mod_size_h = 60
+                    mod_size_w = 108
+                    h_pad = (mod_size_h - h % mod_size_h) % mod_size_h
+                    w_pad = (mod_size_w - w % mod_size_w) % mod_size_w
+                    masked_imgs = torch.cat(
+                        [masked_imgs, torch.flip(masked_imgs, [3])],
+                        3)[:, :, :, :h + h_pad, :]
+                    masked_imgs = torch.cat(
+                        [masked_imgs, torch.flip(masked_imgs, [4])],
+                        4)[:, :, :, :, :w + w_pad]
+                    pred_imgs, _ = model(masked_imgs, len(neighbor_ids))
+                    pred_imgs = pred_imgs[:, :, :h, :w]
+                    pred_imgs = (pred_imgs + 1) / 2
+                    pred_imgs = pred_imgs.cpu().permute(0, 2, 3, 1).numpy() * 255
+                    for i in range(len(neighbor_ids)):
+                        idx = neighbor_ids[i]
+                        img = np.array(pred_imgs[i]).astype(
+                            np.uint8) * binary_masks[i] + frames[idx] * (
+                                1 - binary_masks[i])
+                        if comp_frames[idx] is None:
+                            comp_frames[idx] = img
+                        else:
+                            comp_frames[idx] = comp_frames[idx].astype(
+                                np.float32) * 0.5 + img.astype(np.float32) * 0.5
+                
+                #get output frame (only the last output frame will be displayed so it's real time)
+                
+                cv2.imshow('Result', comp_frames[max_frames - 1]) 
+                
+                c = cv2.waitKey(1)
+                if c == 27:
+                    break
+        
+        cap.release()
 
 if __name__ == '__main__':
     main_worker()
